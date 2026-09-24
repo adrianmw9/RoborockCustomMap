@@ -2,23 +2,26 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from homeassistant.components.roborock.coordinator import RoborockDataUpdateCoordinator
 from homeassistant.components.roborock.entity import RoborockCoordinatedEntityV1
-from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
 
-from .const import (
-    CONF_MAP_ROTATION,
-    DEFAULT_MAP_ROTATION,
-    DOMAIN,
-    MAP_ROTATION_OPTIONS,
-    SIGNAL_ROTATION_CHANGED,
-)
+from .entity import MapRotationSelectMixin
+from .helpers import async_setup_map_entities
+
+# Home Assistant versions without B01 Q7/Q10 support can't import these.
+try:
+    from . import q7
+except ImportError:
+    q7 = None
+try:
+    from . import q10
+except ImportError:
+    q10 = None
 
 PARALLEL_UPDATES = 0
 
@@ -29,26 +32,46 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up rotation Select entities (one per map)."""
-    async_add_entities(
-        RoborockMapRotationSelect(
+    async_setup_map_entities(
+        hass,
+        config_entry,
+        async_add_entities,
+        lambda coord, home, map_info: RoborockMapRotationSelect(
             config_entry=config_entry,
             unique_id=f"{coord.duid_slug}_map_rotation_{map_info.map_flag}",
             coordinator=coord,
             map_flag=map_info.map_flag,
             map_name=map_info.name,
-        )
-        for coord in config_entry.runtime_data
-        if coord.properties_api.home is not None
-        for map_info in (coord.properties_api.home.home_map_info or {}).values()
+        ),
+        _device_factories(config_entry),
     )
 
 
-class RoborockMapRotationSelect(RoborockCoordinatedEntityV1, RestoreEntity, SelectEntity):
-    """Select entity to control map rotation."""
+def _device_factories(config_entry: ConfigEntry) -> list[tuple[type, Any]]:
+    factories: list[tuple[type, Any]] = []
+    if q7 is not None:
+        factories.append(
+            (
+                q7.RoborockB01Q7UpdateCoordinator,
+                lambda coord: q7.RoborockQ7MapRotationSelect(config_entry, coord)
+                if q7.supports_map(coord)
+                else None,
+            )
+        )
+    if q10 is not None:
+        factories.append(
+            (
+                q10.RoborockB01Q10UpdateCoordinator,
+                lambda coord: q10.RoborockQ10MapRotationSelect(config_entry, coord)
+                if q10.supports_map(coord)
+                else None,
+            )
+        )
+    return factories
 
-    _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.CONFIG
-    _attr_translation_key = "rotation"
+
+class RoborockMapRotationSelect(RoborockCoordinatedEntityV1, MapRotationSelectMixin):
+    """Select entity to control map rotation."""
 
     def __init__(
         self,
@@ -61,47 +84,9 @@ class RoborockMapRotationSelect(RoborockCoordinatedEntityV1, RestoreEntity, Sele
         """Initialize rotation select."""
         RoborockCoordinatedEntityV1.__init__(self, unique_id, coordinator)
 
-        self.config_entry = config_entry
         self.map_flag = map_flag
-        self.rotation_key = f"{coordinator.duid_slug}_{map_flag}"
-
-        if not map_name:
-            map_name = f"Map {map_flag}"
-
-        self._attr_name = f"{map_name} rotation"
-        self._attr_options = [str(v) for v in MAP_ROTATION_OPTIONS]
-        self._attr_current_option = str(DEFAULT_MAP_ROTATION)
-
-    async def async_added_to_hass(self) -> None:
-        """Restore previous rotation setting and store in hass.data."""
-        await super().async_added_to_hass()
-
-        if (last := await self.async_get_last_state()) is not None:
-            if last.state in self._attr_options:
-                self._attr_current_option = last.state
-
-        # Persist selection for the image entity to read
-        self.hass.data[DOMAIN][self.config_entry.entry_id][CONF_MAP_ROTATION][
-            self.rotation_key
-        ] = int(self._attr_current_option)
-
-        self.async_write_ha_state()
-
-    async def async_select_option(self, option: str) -> None:
-        """Handle user selecting a rotation option."""
-        if option not in self._attr_options:
-            return
-
-        self._attr_current_option = option
-
-        self.hass.data[DOMAIN][self.config_entry.entry_id][CONF_MAP_ROTATION][
-            self.rotation_key
-        ] = int(option)
-
-        # Notify the image entity to bust the cache via image_last_updated bump
-        async_dispatcher_send(
-            self.hass,
-            f"{SIGNAL_ROTATION_CHANGED}_{self.config_entry.entry_id}_{self.rotation_key}",
+        self._init_rotation(
+            config_entry,
+            f"{coordinator.duid_slug}_{map_flag}",
+            map_name or f"Map {map_flag}",
         )
-
-        self.async_write_ha_state()

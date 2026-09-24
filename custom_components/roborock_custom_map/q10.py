@@ -1,0 +1,229 @@
+"""Roborock Custom Map entities for B01 Q10 devices.
+
+Requires a Home Assistant version whose Roborock integration supports Q10
+devices; importing this module raises ImportError otherwise.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from roborock.map.b01_grid_layers import GridCalibration
+from roborock.map.b01_q10_map_parser import Q10MapPacket, Q10TracePacket
+from roborock.map.b01_q10_render import solve_q10_calibration
+
+from homeassistant.components.image import ImageEntity
+from homeassistant.components.roborock.coordinator import (
+    RoborockB01Q10UpdateCoordinator,
+)
+from homeassistant.components.roborock.entity import RoborockCoordinatedEntityB01Q10
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
+from homeassistant.core import callback
+from homeassistant.util import dt as dt_util
+
+from .entity import MapRotationImageMixin, MapRotationSelectMixin, png_dimensions
+
+# The Q10 pushes only its current map, so each device has a single map entity.
+MAP_NAME = "Map"
+
+# Header resolution is in centimetres per grid pixel while zone/erase vectors
+# use 5 mm units, so one header unit is two vector units.
+_VECTOR_UNITS_PER_HEADER_RESOLUTION_UNIT = 2
+# Grid cell values >= this are walls/background; room cells are room_id * 4.
+_WALL_THRESHOLD = 240
+
+
+def supports_map(coordinator: RoborockB01Q10UpdateCoordinator) -> bool:
+    """Return if the installed python-roborock exposes the Q10 map."""
+    return hasattr(getattr(coordinator.api, "map", None), "image_content")
+
+
+def _rotation_key(coordinator: RoborockB01Q10UpdateCoordinator) -> str:
+    return f"{coordinator.duid_slug}_q10"
+
+
+def _vector_calibration(
+    packet: Q10MapPacket, trace: Q10TracePacket | None
+) -> GridCalibration | None:
+    """World (5 mm vector units) to grid-pixel transform for the map packet.
+
+    Uses the fixed origin from the map header when present, otherwise the
+    transform fitted to the cleaning trace (2.5 mm units, halved).
+    """
+    header = packet.header_calibration
+    if (
+        header is not None
+        and header.resolution > 0
+        and (origin := header.origin_pixels()) is not None
+    ):
+        return GridCalibration(
+            resolution=header.resolution * _VECTOR_UNITS_PER_HEADER_RESOLUTION_UNIT,
+            origin_x=origin[0],
+            origin_y=origin[1],
+        )
+    if (trace_calibration := solve_q10_calibration(packet, trace)) is None:
+        return None
+    return GridCalibration(
+        resolution=trace_calibration.resolution / 2,
+        origin_x=trace_calibration.origin_x,
+        origin_y=trace_calibration.origin_y,
+        y_sign=trace_calibration.y_sign,
+    )
+
+
+def _calibration_points(
+    calibration: GridCalibration, pixels_per_cell: float
+) -> list[dict[str, Any]]:
+    """Three vacuum/map point pairs describing the transform, for map cards."""
+    points = []
+    for x, y in ((0, 0), (1000, 0), (0, 1000)):
+        px, py = calibration.world_to_pixel(x, y)
+        points.append(
+            {
+                "vacuum": {"x": x, "y": y},
+                "map": {"x": px * pixels_per_cell, "y": py * pixels_per_cell},
+            }
+        )
+    return points
+
+
+def _rooms(
+    packet: Q10MapPacket, calibration: GridCalibration
+) -> dict[int, dict[str, Any]]:
+    """Room bounding boxes in vacuum coordinates."""
+    bounds: dict[int, list[int]] = {}
+    width = packet.width
+    for index, value in enumerate(packet.grid):
+        if not 0 < value < _WALL_THRESHOLD:
+            continue
+        x, y = index % width, index // width
+        if (b := bounds.get(value)) is None:
+            bounds[value] = [x, y, x, y]
+        else:
+            b[0] = min(b[0], x)
+            b[1] = min(b[1], y)
+            b[2] = max(b[2], x)
+            b[3] = max(b[3], y)
+
+    rooms = {}
+    for room in packet.rooms:
+        if (b := bounds.get(room.pixel_value)) is None:
+            continue
+        ax, ay = calibration.pixel_to_world(b[0], b[1])
+        bx, by = calibration.pixel_to_world(b[2] + 1, b[3] + 1)
+        x0, x1 = sorted((ax, bx))
+        y0, y1 = sorted((ay, by))
+        rooms[room.id] = {
+            "x0": x0,
+            "y0": y0,
+            "x1": x1,
+            "y1": y1,
+            "number": room.id,
+            "name": room.name,
+            "pos_x": (x0 + x1) / 2,
+            "pos_y": (y0 + y1) / 2,
+        }
+    return rooms
+
+
+class RoborockQ10Map(MapRotationImageMixin, RoborockCoordinatedEntityB01Q10, ImageEntity):
+    """The current map of a Q10 device, with rotation and calibration."""
+
+    _attr_has_entity_name = True
+    _attr_content_type = "image/png"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        config_entry: ConfigEntry,
+        coordinator: RoborockB01Q10UpdateCoordinator,
+    ) -> None:
+        """Initialize a Roborock Q10 map."""
+        RoborockCoordinatedEntityB01Q10.__init__(
+            self, f"{coordinator.duid_slug}_custom_map", coordinator
+        )
+        ImageEntity.__init__(self, coordinator.hass)
+
+        self.config_entry = config_entry
+        self.rotation_key = _rotation_key(coordinator)
+        self._map_trait = coordinator.api.map
+        self._attr_name = f"{MAP_NAME}_custom"
+
+        self.cached_map: bytes | None = None
+        self._raw_image_size: tuple[int, int] | None = None
+        self._rooms_packet: Q10MapPacket | None = None
+        self._rooms_calibration: GridCalibration | None = None
+        self._cached_rooms: dict[int, dict[str, Any]] = {}
+
+    async def async_added_to_hass(self) -> None:
+        """Register a trait listener for push-based map updates."""
+        await super().async_added_to_hass()
+        self._async_listen_rotation()
+        self.async_on_remove(
+            self._map_trait.add_update_listener(self._handle_map_update)
+        )
+        # Pick up a map that was pushed before the entity was added.
+        self._handle_map_update()
+
+    @callback
+    def _handle_map_update(self) -> None:
+        """Cache the newly pushed map if its content changed."""
+        image_content = self._map_trait.image_content
+        if image_content is None or image_content == self.cached_map:
+            return
+        self.cached_map = image_content
+        self._raw_image_size = png_dimensions(image_content)
+        self._attr_image_last_updated = dt_util.utcnow()
+        self.async_write_ha_state()
+
+    async def async_image(self) -> bytes | None:
+        """Get the image (with optional rotation)."""
+        if self.cached_map is None:
+            return None
+        return await self._async_rotated_image(self.cached_map)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return extra attributes for map card usage (rotation-aware calibration)."""
+        # The map trait exposes the rendered image but not the packets needed
+        # to place things on it.
+        packet: Q10MapPacket | None = getattr(self._map_trait, "_map_packet", None)
+        trace: Q10TracePacket | None = getattr(self._map_trait, "_trace_packet", None)
+        if (
+            packet is None
+            or self._raw_image_size is None
+            or (calibration := _vector_calibration(packet, trace)) is None
+        ):
+            return {}
+
+        if packet is not self._rooms_packet or calibration != self._rooms_calibration:
+            self._rooms_packet = packet
+            self._rooms_calibration = calibration
+            self._cached_rooms = _rooms(packet, calibration)
+
+        pixels_per_cell = self._raw_image_size[0] / packet.width
+        return {
+            "calibration_points": self._rotate_calibration(
+                _calibration_points(calibration, pixels_per_cell)
+            ),
+            "rooms": self._cached_rooms,
+            "zones": None,
+        }
+
+
+class RoborockQ10MapRotationSelect(
+    RoborockCoordinatedEntityB01Q10, MapRotationSelectMixin
+):
+    """Select entity to control Q10 map rotation."""
+
+    def __init__(
+        self,
+        config_entry: ConfigEntry,
+        coordinator: RoborockB01Q10UpdateCoordinator,
+    ) -> None:
+        """Initialize rotation select."""
+        RoborockCoordinatedEntityB01Q10.__init__(
+            self, f"{coordinator.duid_slug}_map_rotation_q10", coordinator
+        )
+        self._init_rotation(config_entry, _rotation_key(coordinator), MAP_NAME)

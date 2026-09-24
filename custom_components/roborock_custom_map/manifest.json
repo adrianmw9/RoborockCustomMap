@@ -1,12 +1,12 @@
 {
   "domain": "roborock_custom_map",
   "name": "Roborock Custom Map",
-  "codeowners": ["@Lash-L"],
+  "codeowners": [ "@Lash-L", "msc5" ],
   "config_flow": true,
   "dependencies": ["roborock"],
-  "documentation": "https://github.com/Lash-L/RoborockCustomMap",
+  "documentation": "https://github.com/msc5/RoborockCustomMap",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/Lash-L/RoborockCustomMap/issues",
+  "issue_tracker": "https://github.com/msc5/RoborockCustomMap/issues",
   "requirements": [],
-  "version": "0.1.6"
+  "version": "2.0.0"
 }

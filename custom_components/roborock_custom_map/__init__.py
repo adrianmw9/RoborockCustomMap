@@ -14,22 +14,22 @@ PLATFORMS = [Platform.IMAGE, Platform.SELECT]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Roborock Custom map from a config entry."""
-    roborock_entries = hass.config_entries.async_entries("roborock")
-    coordinators = []
+    roborock_entries = [
+        r_entry for r_entry in hass.config_entries.async_entries("roborock")
+        if r_entry.state == ConfigEntryState.LOADED
+    ]
 
     @callback
     def unload_this_entry() -> None:
         hass.async_create_task(hass.config_entries.async_reload(entry.entry_id))
 
-    for r_entry in roborock_entries:
-        if r_entry.state == ConfigEntryState.LOADED:
-            coordinators.extend(r_entry.runtime_data.v1)
-            r_entry.async_on_unload(unload_this_entry)
-
-    if not coordinators:
+    if not roborock_entries:
         raise ConfigEntryNotReady("No Roborock entries loaded. Cannot start.")
 
-    entry.runtime_data = coordinators
+    for r_entry in roborock_entries:
+        r_entry.async_on_unload(unload_this_entry)
+
+    entry.runtime_data = roborock_entries
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN].setdefault(entry.entry_id, {})

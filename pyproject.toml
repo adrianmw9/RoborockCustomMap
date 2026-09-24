@@ -1,0 +1,18 @@
+[project]
+name = "roborockcustommap"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "homeassistant>=2025.4.4",
+]
+
+[dependency-groups]
+dev = [
+    "autopep8>=2.3.2",
+    "basedpyright>=1.40.1",
+    "ipdb>=0.13.13",
+    "ipython>=9.17.1",
+    "rich>=15.0.0",
+]
