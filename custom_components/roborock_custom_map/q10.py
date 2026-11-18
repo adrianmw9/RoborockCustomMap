@@ -9,10 +9,15 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from roborock.data.b01_q10.b01_q10_code_mappings import B01_Q10_DP
 from roborock.data.b01_q10.b01_q10_containers import Q10RoborockPoint
 from roborock.exceptions import RoborockException
 from roborock.map.b01_grid_layers import GridCalibration
-from roborock.map.b01_q10_map_parser import Q10MapPacket, Q10TracePacket
+from roborock.map.b01_q10_map_parser import (
+    Q10MapPacket,
+    Q10MapPacketKind,
+    Q10TracePacket,
+)
 from roborock.map.b01_q10_render import (
     Q10MapOverlays,
     render_q10_map,
@@ -66,6 +71,57 @@ def _saved_rotation_key(
 
 def _saved_map_name(map_id: str, map_name: str | None) -> str:
     return map_name or f"Map {map_id}"
+
+
+def _saved_map_list(maps_trait: Any) -> list[Any]:
+    """Return saved maps across python-roborock API versions."""
+    if hasattr(maps_trait, "map_list"):
+        return list(maps_trait.map_list)
+    multi_map = getattr(maps_trait, "multi_map", None)
+    if (
+        multi_map is None
+        or getattr(multi_map, "op", None) != "list"
+        or getattr(multi_map, "result", None) != 1
+    ):
+        return []
+    return list(getattr(multi_map, "data", []))
+
+
+async def _async_refresh_saved_map_detail(maps_trait: Any, map_id: str) -> None:
+    """Request a read-only saved-map preview across library versions."""
+    if hasattr(maps_trait, "refresh_detail"):
+        await maps_trait.refresh_detail(map_id)
+        return
+    # python-roborock 7.12 (bundled with HA 2026.10) parses saved-map detail
+    # packets but predates the public helper. Q10 firmware's `select` operation
+    # requests the same read-only preview and does not apply/relocate the map.
+    await maps_trait._command.send(  # noqa: SLF001
+        B01_Q10_DP.COMMON,
+        {
+            str(B01_Q10_DP.MULTI_MAP.code): {
+                "op": "select",
+                "id": map_id,
+            }
+        },
+    )
+
+
+async def _async_set_current_saved_map(maps_trait: Any, map_id: str) -> None:
+    """Apply a saved map across python-roborock API versions."""
+    if map_id not in {str(map_info.id) for map_info in _saved_map_list(maps_trait)}:
+        raise RoborockException(f"Unknown Q10 saved-map ID: {map_id}")
+    if hasattr(maps_trait, "set_current_map"):
+        await maps_trait.set_current_map(map_id)
+        return
+    await maps_trait._command.send(  # noqa: SLF001
+        B01_Q10_DP.COMMON,
+        {
+            str(B01_Q10_DP.MULTI_MAP.code): {
+                "op": "apply",
+                "id": map_id,
+            }
+        },
+    )
 
 
 def _vector_calibration(
@@ -183,6 +239,8 @@ class RoborockQ10Map(MapRotationImageMixin, RoborockCoordinatedEntityB01Q10, Ima
         self._attr_name = f"{MAP_NAME}_custom"
 
         self.cached_map: bytes | None = None
+        self._current_packet: Q10MapPacket | None = None
+        self._current_trace: Q10TracePacket | None = None
         self._raw_image_size: tuple[int, int] | None = None
         self._rooms_packet: Q10MapPacket | None = None
         self._rooms_calibration: GridCalibration | None = None
@@ -231,7 +289,7 @@ class RoborockQ10Map(MapRotationImageMixin, RoborockCoordinatedEntityB01Q10, Ima
         if self._async_add_entities is None or self._maps_trait is None:
             return
         new_entities = []
-        for map_info in self._maps_trait.map_list:
+        for map_info in _saved_map_list(self._maps_trait):
             map_id = str(map_info.id)
             if map_id in self._saved_map_ids:
                 continue
@@ -261,9 +319,14 @@ class RoborockQ10Map(MapRotationImageMixin, RoborockCoordinatedEntityB01Q10, Ima
     @callback
     def _handle_map_update(self) -> None:
         """Cache the newly pushed map if its content changed."""
+        packet: Q10MapPacket | None = getattr(self._map_trait, "_map_packet", None)
+        if packet is not None and packet.kind is Q10MapPacketKind.SAVED_MAP_DETAIL:
+            return
         image_content = self._map_trait.image_content
         if image_content is None or image_content == self.cached_map:
             return
+        self._current_packet = packet
+        self._current_trace = getattr(self._map_trait, "_trace_packet", None)
         self.cached_map = image_content
         self._raw_image_size = png_dimensions(image_content)
         self._attr_image_last_updated = dt_util.utcnow()
@@ -280,8 +343,8 @@ class RoborockQ10Map(MapRotationImageMixin, RoborockCoordinatedEntityB01Q10, Ima
         """Return extra attributes for map card usage (rotation-aware calibration)."""
         # The map trait exposes the rendered image but not the packets needed
         # to place things on it.
-        packet: Q10MapPacket | None = getattr(self._map_trait, "_map_packet", None)
-        trace: Q10TracePacket | None = getattr(self._map_trait, "_trace_packet", None)
+        packet = self._current_packet
+        trace = self._current_trace
         if (
             packet is None
             or self._raw_image_size is None
@@ -330,6 +393,7 @@ class RoborockQ10SavedMap(
         self.map_id = map_id
         self.rotation_key = _saved_rotation_key(coordinator, map_id)
         self._maps_trait = coordinator.api.maps
+        self._map_trait = coordinator.api.map
         self._map_config = getattr(
             coordinator.api.map, "_config", MapParserConfig()
         )
@@ -347,6 +411,11 @@ class RoborockQ10SavedMap(
         self.async_on_remove(
             self._maps_trait.add_update_listener(self._handle_map_update)
         )
+        # python-roborock 7.12 routes saved-map detail packets through the live
+        # map trait. Newer versions expose them on the saved-maps trait.
+        self.async_on_remove(
+            self._map_trait.add_update_listener(self._handle_map_update)
+        )
         self._handle_map_update()
         self.config_entry.async_create_background_task(
             self.hass,
@@ -360,16 +429,22 @@ class RoborockQ10SavedMap(
     async def _async_refresh_map(self) -> None:
         """Request a read-only saved-map preview."""
         try:
-            await self._maps_trait.refresh_detail(self.map_id)
+            await _async_refresh_saved_map_detail(self._maps_trait, self.map_id)
         except RoborockException as err:
             _LOGGER.debug("Failed to fetch Q10 saved map %s: %s", self.map_id, err)
 
     @callback
     def _handle_map_update(self) -> None:
         """Render the preview packet matching this entity."""
+        packet = getattr(self._maps_trait, "detail_packet", None)
+        detail_map_id = getattr(self._maps_trait, "detail_map_id", None)
+        if packet is None:
+            packet = getattr(self._map_trait, "_map_packet", None)
+            detail_map_id = getattr(packet, "map_id", None)
         if (
-            str(getattr(self._maps_trait, "detail_map_id", "")) != self.map_id
-            or (packet := self._maps_trait.detail_packet) is None
+            packet is None
+            or packet.kind is not Q10MapPacketKind.SAVED_MAP_DETAIL
+            or str(detail_map_id) != self.map_id
             or packet is self._packet
         ):
             return
@@ -391,6 +466,26 @@ class RoborockQ10SavedMap(
             self._cached_rooms = _rooms(packet, calibration)
         self._attr_image_last_updated = dt_util.utcnow()
         self.async_write_ha_state()
+        self.config_entry.async_create_background_task(
+            self.hass,
+            self._async_restore_live_map(),
+            name=(
+                "roborock_custom_map_q10_restore_live_map_"
+                f"{self.coordinator.duid}_{self.map_id}"
+            ),
+        )
+
+    async def _async_restore_live_map(self) -> None:
+        """Restore the live-map trait after a legacy preview response."""
+        # Newer python-roborock versions route previews only to MapsTrait, so
+        # there is nothing to restore. In 7.12 the packet temporarily replaces
+        # MapContentTrait's source packet; REQUEST_DPS safely restores it.
+        if hasattr(self._maps_trait, "detail_packet"):
+            return
+        try:
+            await self._map_trait.refresh()
+        except RoborockException as err:
+            _LOGGER.debug("Failed to restore Q10 live map after preview: %s", err)
 
     async def async_image(self) -> bytes | None:
         """Return the saved preview with its configured rotation."""
@@ -472,7 +567,7 @@ class RoborockQ10MapRotationSelect(
         """Add map selector and one rotation select per saved map."""
         if self._async_add_entities is None or self._maps_trait is None:
             return
-        map_list = self._maps_trait.map_list
+        map_list = _saved_map_list(self._maps_trait)
         if not map_list:
             return
 
@@ -558,7 +653,7 @@ class RoborockQ10SavedMapSelect(
     def _sync_options(self) -> None:
         """Build stable, unique user-facing options from the map list."""
         option_to_id: dict[str, str] = {}
-        for map_info in self._maps_trait.map_list:
+        for map_info in _saved_map_list(self._maps_trait):
             map_id = str(map_info.id)
             base = _saved_map_name(map_id, map_info.name)
             option = base
@@ -585,7 +680,7 @@ class RoborockQ10SavedMapSelect(
         """Apply the selected saved map and refresh the live map entity."""
         if (map_id := self._option_to_id.get(option)) is None:
             raise ValueError(f"Unknown Q10 saved map option: {option}")
-        await self._maps_trait.set_current_map(map_id)
+        await _async_set_current_saved_map(self._maps_trait, map_id)
         self._selected_map_id = map_id
         self._attr_current_option = option
         self.async_write_ha_state()
