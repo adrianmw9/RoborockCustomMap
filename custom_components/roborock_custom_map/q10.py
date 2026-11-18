@@ -6,9 +6,11 @@ devices; importing this module raises ImportError otherwise.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from roborock.data.b01_q10.b01_q10_containers import Q10RoborockPoint
+from roborock.exceptions import RoborockException
 from roborock.map.b01_grid_layers import GridCalibration
 from roborock.map.b01_q10_map_parser import Q10MapPacket, Q10TracePacket
 from roborock.map.b01_q10_render import solve_q10_calibration
@@ -24,6 +26,8 @@ from homeassistant.core import callback
 from homeassistant.util import dt as dt_util
 
 from .entity import MapRotationImageMixin, MapRotationSelectMixin, png_dimensions
+
+_LOGGER = logging.getLogger(__name__)
 
 # The Q10 pushes only its current map, so each device has a single map entity.
 MAP_NAME = "Map"
@@ -168,6 +172,25 @@ class RoborockQ10Map(MapRotationImageMixin, RoborockCoordinatedEntityB01Q10, Ima
             self._map_trait.add_update_listener(self._handle_map_update)
         )
         # Pick up a map that was pushed before the entity was added.
+        self._handle_map_update()
+        # Request the idle map after startup. Without this, a freshly restarted
+        # Home Assistant has no calibration until the robot happens to push a
+        # map update (normally when a cleaning job starts).
+        self.config_entry.async_create_background_task(
+            self.hass,
+            self._async_refresh_map(),
+            name=f"roborock_custom_map_q10_refresh_{self.coordinator.duid}",
+        )
+
+    async def _async_refresh_map(self) -> None:
+        """Request the current map without starting or relocating the robot."""
+        try:
+            await self._map_trait.refresh()
+        except RoborockException as err:
+            _LOGGER.debug("Failed to fetch Q10 map: %s", err)
+            return
+        # The response is normally delivered by the registered listener. This
+        # also handles implementations that update the trait before returning.
         self._handle_map_update()
 
     @callback
