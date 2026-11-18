@@ -43,11 +43,14 @@ async def async_setup_entry(
             map_flag=map_info.map_flag,
             map_name=map_info.name,
         ),
-        _device_factories(config_entry),
+        _device_factories(config_entry, async_add_entities),
     )
 
 
-def _device_factories(config_entry: ConfigEntry) -> list[tuple[type, Any]]:
+def _device_factories(
+    config_entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> list[tuple[type, Any]]:
     factories: list[tuple[type, Any]] = []
     if q7 is not None:
         factories.append(
@@ -62,7 +65,9 @@ def _device_factories(config_entry: ConfigEntry) -> list[tuple[type, Any]]:
         factories.append(
             (
                 q10.RoborockB01Q10UpdateCoordinator,
-                lambda coord: q10.RoborockQ10MapRotationSelect(config_entry, coord)
+                lambda coord: q10.RoborockQ10MapRotationSelect(
+                    config_entry, coord, async_add_entities
+                )
                 if q10.supports_map(coord)
                 else None,
             )
