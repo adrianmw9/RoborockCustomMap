@@ -194,8 +194,11 @@ def _rooms(
             continue
         ax, ay = calibration.pixel_to_world(b[0], b[1])
         bx, by = calibration.pixel_to_world(b[2] + 1, b[3] + 1)
-        first_corner = Q10RoborockPoint.from_vector(ax, ay)
-        second_corner = Q10RoborockPoint.from_vector(bx, by)
+        # GridCalibration uses floats so it can also represent transforms
+        # fitted from traces. Q10 vector coordinates are an integer wire grid,
+        # however, and python-roborock 7.12 validates that strictly.
+        first_corner = Q10RoborockPoint.from_vector(round(ax), round(ay))
+        second_corner = Q10RoborockPoint.from_vector(round(bx), round(by))
         x0, x1 = sorted((first_corner.x, second_corner.x))
         y0, y1 = sorted((first_corner.y, second_corner.y))
         rooms[room.id] = {
