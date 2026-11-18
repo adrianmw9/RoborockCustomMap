@@ -23,7 +23,7 @@ your device, and this integration follows it.
 | Device type | Examples | Supported | Notes |
 |---|---|---|---|
 | **V1** | Most Roborock robot vacuums: S4, S5, S6, S7, S8, Q5, Q7 / Q7 Max / Q7+, Q8 Max, Qrevo, Saros, E-series, and others | ✅ | One map entity per saved map. Calibration, rooms and zones. |
-| **B01 Q10** | Q10 family (model codes containing `ss`, e.g. `roborock.vacuum.ss07`) | ✅ | One entity for the current map. Calibration and rooms (as bounding boxes). |
+| **B01 Q10** | Q10 family (model codes containing `ss`, e.g. `roborock.vacuum.ss07`) | ✅ | Live map plus one preview entity per saved map. Calibration and rooms (as bounding boxes). |
 | **B01 Q7** | Newer Q7 family (model codes starting with `sc`) | ✅ | One entity for the current map. Calibration only; the device does not report room shapes. |
 | **A01** | Dyad wet/dry vacuums, Zeo washers/dryers | ➖ | Not applicable, these devices have no map. |
 
@@ -45,7 +45,9 @@ the Roborock library bundled with your Home Assistant version can read the devic
 
 ### Limitations of B01 devices
 
-- They only report their current map, so there is one map entity (and one rotation select) per device.
+- Q10 devices push their live map and expose saved maps through read-only previews. This integration
+  creates one image and rotation entity per saved map, plus a `Selected map` entity for switching the
+  active map before cleaning. B01 Q7 devices still expose only their current map.
 - Q10 rooms are reported as rectangular bounding boxes, not exact outlines.
 - Q7 maps have no room geometry, so the map card cannot generate room configs for them.
 - The core integration does not fetch Q7 maps, so this integration requests the map itself: once at
