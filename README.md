@@ -50,7 +50,10 @@ the Roborock library bundled with your Home Assistant version can read the devic
 - Q7 maps have no room geometry, so the map card cannot generate room configs for them.
 - The core integration does not fetch Q7 maps, so this integration requests the map itself: once at
   startup and every 10 minutes while idle. During cleaning the device pushes live map updates.
-- Zone and point cleaning from the map card are not supported for B01 devices.
+- B01 Q7 devices do not support zone or point cleaning from the map card.
+- B01 Q10 zone cleaning requires a recent Home Assistant/python-roborock version
+  with Q10 zoned-cleaning support. The map entity exposes the common Roborock
+  millimetre coordinates expected by that action.
 
 ## Setup
 
