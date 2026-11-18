@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from roborock.data.b01_q10.b01_q10_containers import Q10RoborockPoint
 from roborock.map.b01_grid_layers import GridCalibration
 from roborock.map.b01_q10_map_parser import Q10MapPacket, Q10TracePacket
 from roborock.map.b01_q10_render import solve_q10_calibration
@@ -79,9 +80,10 @@ def _calibration_points(
     points = []
     for x, y in ((0, 0), (1000, 0), (0, 1000)):
         px, py = calibration.world_to_pixel(x, y)
+        vacuum_point = Q10RoborockPoint.from_vector(x, y)
         points.append(
             {
-                "vacuum": {"x": x, "y": y},
+                "vacuum": {"x": vacuum_point.x, "y": vacuum_point.y},
                 "map": {"x": px * pixels_per_cell, "y": py * pixels_per_cell},
             }
         )
@@ -112,8 +114,10 @@ def _rooms(
             continue
         ax, ay = calibration.pixel_to_world(b[0], b[1])
         bx, by = calibration.pixel_to_world(b[2] + 1, b[3] + 1)
-        x0, x1 = sorted((ax, bx))
-        y0, y1 = sorted((ay, by))
+        first_corner = Q10RoborockPoint.from_vector(ax, ay)
+        second_corner = Q10RoborockPoint.from_vector(bx, by)
+        x0, x1 = sorted((first_corner.x, second_corner.x))
+        y0, y1 = sorted((first_corner.y, second_corner.y))
         rooms[room.id] = {
             "x0": x0,
             "y0": y0,
